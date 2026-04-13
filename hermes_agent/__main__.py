@@ -2,6 +2,7 @@
 """
 Hermes Agent - neovegasherlock_bot
 執行於 Zeabur VPS，使用 kimi-k2.5 模型分析輸入並產出 JSONL 指令
+包含 Web UI 端口供外部連線
 """
 
 import os
@@ -10,6 +11,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
+from aiohttp import web
 
 import aiohttp
 from telegram import Update
@@ -29,12 +31,16 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-NQXHpmDhh4SHISdAtMtFEGCcbkJjYEW
 OPENAI_BASE_URL = os.getenv("OPENAI_API_BASE", "https://opencode.ai/zen/go/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "kimi-k2.5")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n.neovega.cc/webhook/sherlock-output")
+WEB_PORT = int(os.getenv("PORT", "8080"))
 
 # 初始化 OpenAI 客戶端
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
 )
+
+# 儲存最近的分析結果
+recent_analyses = []
 
 # System Prompt
 SYSTEM_PROMPT = """你是 Sherlock，一個專業的分析偵探 AI。
@@ -62,6 +68,78 @@ SYSTEM_PROMPT = """你是 Sherlock，一個專業的分析偵探 AI。
 4. target 欄位正確指定 bot
 """
 
+
+# ========== Web UI Handlers ==========
+
+async def web_index(request):
+    """Web UI 首頁"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Hermes Agent - Sherlock</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+            h1 { color: #333; }
+            .status { background: #e3f2fd; padding: 15px; border-radius: 8px; margin: 20px 0; }
+            .analysis { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; }
+            pre { background: #333; color: #0f0; padding: 10px; overflow-x: auto; }
+            .info { color: #666; font-size: 14px; }
+        </style>
+    </head>
+    <body>
+        <h1>🔍 Hermes Agent - Sherlock</h1>
+        <div class="status">
+            <h3>狀態</h3>
+            <p>🤖 Bot: neovegasherlock_bot</p>
+            <p>🧠 模型: kimi-k2.5</p>
+            <p>📡 n8n: Connected</p>
+            <p>⏰ 啟動時間: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
+        </div>
+        <h2>最近分析記錄</h2>
+        <div id="analyses">
+            <p class="info">使用 Telegram 與 @neovegasherlock_bot 對話...</p>
+        </div>
+        <hr>
+        <p class="info">Hermes Agent v1.0 | <a href="/api/status">API Status</a></p>
+    </body>
+    </html>
+    """
+    return web.Response(text=html, content_type='text/html')
+
+
+async def web_api_status(request):
+    """API 狀態端點"""
+    return web.json_response({
+        "status": "running",
+        "bot": "neovegasherlock_bot",
+        "model": OPENAI_MODEL,
+        "recent_analyses_count": len(recent_analyses),
+        "timestamp": datetime.now().isoformat()
+    })
+
+
+async def web_health(request):
+    """健康檢查端點 - Zeabur 用"""
+    return web.json_response({"status": "ok", "service": "hermes-agent"})
+
+
+async def start_web_server():
+    """啟動 Web Server"""
+    app = web.Application()
+    app.router.add_get('/', web_index)
+    app.router.add_get('/api/status', web_api_status)
+    app.router.add_get('/health', web_health)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', WEB_PORT)
+    await site.start()
+    logger.info(f"🌐 Web UI 已啟動: http://0.0.0.0:{WEB_PORT}")
+
+
+# ========== Telegram Bot Handlers ==========
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/start 指令"""
@@ -140,6 +218,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_text = update.message.text
     session_id = f"sess_{datetime.now().strftime('%Y%m%d%H%M%S')}_{update.message.message_id}"
     
+    # 儲存到最近分析列表
+    recent_analyses.append({
+        "session_id": session_id,
+        "text": user_text[:100],
+        "timestamp": datetime.now().isoformat()
+    })
+    # 只保留最近 10 條
+    if len(recent_analyses) > 10:
+        recent_analyses.pop(0)
+    
     # 顯示分析中
     processing_msg = await update.message.reply_text("🔍 Sherlock 分析中...")
     
@@ -201,13 +289,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await processing_msg.edit_text(f"❌ 處理錯誤: {str(e)}")
 
 
-def main() -> None:
-    """主程式"""
+async def main_async():
+    """非同步主程式"""
     logger.info("neovegasherlock_bot (Hermes Agent) 啟動")
     logger.info(f"模型: {OPENAI_MODEL}")
     logger.info(f"n8n Webhook: {N8N_WEBHOOK_URL}")
+    logger.info(f"Web Port: {WEB_PORT}")
     
-    # 建立 Application
+    # 先啟動 Web Server（Zeabur 健康檢查需要）
+    await start_web_server()
+    logger.info("✅ Web Server 就緒，開始初始化 Telegram Bot...")
+    
+    # 建立 Telegram Application
     app = Application.builder().token(TOKEN).build()
     
     # 添加 handlers
@@ -215,9 +308,26 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # 啟動 polling
-    logger.info("開始 polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # 啟動 Telegram Bot
+    await app.initialize()
+    await app.start()
+    logger.info("🤖 Telegram Bot 開始 polling...")
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # 保持運行
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("正在關閉...")
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+def main() -> None:
+    """主程式入口"""
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
