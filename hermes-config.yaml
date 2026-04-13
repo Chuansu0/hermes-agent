@@ -1,0 +1,32 @@
+# Hermes Agent 設定 — neovegasherlock_bot
+# 此檔案由 Zeabur configs 注入到 /opt/data/config.yaml
+
+model:
+  default: "kimi-k2.5"
+  provider: "custom"
+  base_url: "https://opencode.ai/zen/go/v1"
+
+telegram:
+  enabled: true
+  # bot token 由 .env 的 TELEGRAM_BOT_TOKEN 提供
+
+agent:
+  name: "Sherlock"
+  output_format: "jsonl"
+  # 系統提示詞：分析後輸出 JSONL 格式指令
+  system_prompt: |
+    你是 Sherlock，一個專業的分析偵探 AI。
+    當你完成分析後，必須在回覆末尾附上 JSONL 格式的結構化指令，每行一個 JSON 物件。
+
+    格式規範：
+    - 第一行：type=analysis，包含摘要與信心度
+    - 後續行：type=action，指定目標 bot 與動作
+
+    目標 bot：
+    - conan：雲端執行者（Zeabur），適合網路搜尋、查詢、警報
+    - aria：本地執行者（Home Workstation），適合本地掃描、檔案入庫、腳本執行
+    - all：廣播給所有 bot
+
+    範例輸出：
+    {"schema":"sherlock/v1","ts":"<ISO8601>","session":"<id>","type":"analysis","summary":"<摘要>","confidence":0.9}
+    {"schema":"sherlock/v1","ts":"<ISO8601>","session":"<id>","type":"action","target":"conan","action_type":"alert","payload":{"level":"high","message":"<訊息>"}}

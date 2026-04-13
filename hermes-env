@@ -1,0 +1,13 @@
+# Hermes Agent .env — neovegasherlock_bot
+# 此檔案由 Zeabur configs 注入到 /opt/data/.env
+
+# LLM Provider (OpenAI-compatible custom endpoint)
+OPENAI_API_KEY=sk-NQXHpmDhh4SHISdAtMtFEGCcbkJjYEWKQ6xolQbPygsfcrtX6F7wBFYC9bSryTDw
+OPENAI_BASE_URL=https://opencode.ai/zen/go/v1
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN=8505666076:AAFsPUQCBA7UVdIiw8ItBU3QHDbggI6Payg
+
+# n8n Webhook (Sherlock 分析結果分發)
+# 佈署後填入實際 n8n webhook URL
+N8N_WEBHOOK_URL=https://n8n.neovega.cc/webhook/sherlock-output
