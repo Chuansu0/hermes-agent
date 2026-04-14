@@ -33,6 +33,12 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "kimi-k2.5")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n.neovega.cc/webhook/sherlock-output")
 WEB_PORT = int(os.getenv("PORT", "8080"))
 
+# Bot tokens 與 chat_id 設定（用於直接轉發 JSONL）
+CARRIE_BOT_TOKEN = os.getenv("CARRIE_BOT_TOKEN", "8615424711:AAGLoHijlMpqWX7yD_JhJjKeTS0Dd5H5GTg")
+CONAN_BOT_TOKEN = os.getenv("CONAN_BOT_TOKEN", "8622712926:AAFjLECd5xFxeveZAlRDmqLyFN3sXRIfpvg")
+# 發送者的 chat_id（Sherlock 用對方 bot token 發訊息給這個 chat）
+DISPATCH_CHAT_ID = int(os.getenv("DISPATCH_CHAT_ID", "8240891231"))
+
 # 初始化 OpenAI 客戶端
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
@@ -191,7 +197,7 @@ async def analyze_with_llm(text: str, session_id: str) -> str:
 
 
 async def send_to_n8n(jsonl_data: str, session_id: str) -> bool:
-    """發送 JSONL 到 n8n webhook"""
+    """發送 JSONL 到 n8n webhook（備用）"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -203,11 +209,62 @@ async def send_to_n8n(jsonl_data: str, session_id: str) -> bool:
                     logger.info(f"成功發送到 n8n: session={session_id}")
                     return True
                 else:
-                    logger.error(f"n8n 回應錯誤: {response.status}")
+                    logger.warning(f"n8n 回應: {response.status}（將使用直接轉發）")
                     return False
     except Exception as e:
-        logger.error(f"發送到 n8n 失敗: {e}")
+        logger.warning(f"n8n 不可用: {e}（將使用直接轉發）")
         return False
+
+
+async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
+    """直接透過 Telegram Bot API 轉發 JSONL 給 Carrie/Conan"""
+    results = {"carrie": [], "conan": [], "errors": []}
+    
+    bot_tokens = {
+        "aria": CARRIE_BOT_TOKEN,
+        "carrie": CARRIE_BOT_TOKEN,
+        "conan": CONAN_BOT_TOKEN,
+        "all": None,  # 廣播
+    }
+    
+    for line in jsonl_lines:
+        try:
+            obj = json.loads(line)
+            if obj.get("type") != "action":
+                continue
+            
+            target = obj.get("target", "")
+            targets_to_send = []
+            
+            if target == "all":
+                targets_to_send = [("carrie", CARRIE_BOT_TOKEN), ("conan", CONAN_BOT_TOKEN)]
+            elif target in ("aria", "carrie"):
+                targets_to_send = [("carrie", CARRIE_BOT_TOKEN)]
+            elif target == "conan":
+                targets_to_send = [("conan", CONAN_BOT_TOKEN)]
+            
+            for bot_name, bot_token in targets_to_send:
+                try:
+                    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(url, json={
+                            "chat_id": DISPATCH_CHAT_ID,
+                            "text": line,
+                        }) as resp:
+                            if resp.status == 200:
+                                results[bot_name].append(obj.get("action_type", "unknown"))
+                                logger.info(f"✅ 已轉發給 {bot_name}: {obj.get('action_type')}")
+                            else:
+                                err = await resp.text()
+                                results["errors"].append(f"{bot_name}: {resp.status}")
+                                logger.error(f"轉發給 {bot_name} 失敗: {err}")
+                except Exception as e:
+                    results["errors"].append(f"{bot_name}: {str(e)}")
+                    logger.error(f"轉發給 {bot_name} 異常: {e}")
+        except json.JSONDecodeError:
+            continue
+    
+    return results
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -252,37 +309,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await processing_msg.edit_text(f"⚠️ 無法產出 JSONL 指令\n\nLLM 回應:\n{llm_response[:500]}")
             return
         
-        # 發送到 n8n
-        success = await send_to_n8n(jsonl_data, session_id)
+        # 直接轉發 JSONL 給 Carrie/Conan（主要通道）
+        dispatch_results = await dispatch_to_bots(jsonl_lines, session_id)
         
-        if success:
-            # 解析目標 bot
-            targets = []
-            for line in jsonl_lines:
-                try:
-                    obj = json.loads(line)
-                    if obj.get("type") == "action":
-                        target = obj.get("target", "unknown")
-                        if target not in targets:
-                            targets.append(target)
-                except:
-                    pass
-            
-            target_text = ", ".join(targets) if targets else "unknown"
-            
-            await processing_msg.edit_text(
-                f"✅ 分析完成！\n\n"
-                f"📤 已發送指令給: {target_text}\n"
-                f"🆔 Session: {session_id}\n\n"
-                f"```jsonl\n{jsonl_data[:300]}...\n```",
-                parse_mode="Markdown",
-            )
-        else:
-            await processing_msg.edit_text(
-                f"⚠️ 分析完成但發送到 n8n 失敗\n\n"
-                f"```jsonl\n{jsonl_data[:500]}\n```",
-                parse_mode="Markdown",
-            )
+        # 也嘗試發送到 n8n（備用/記錄用）
+        await send_to_n8n(jsonl_data, session_id)
+        
+        # 組裝結果訊息
+        dispatched = []
+        if dispatch_results["carrie"]:
+            dispatched.append(f"🏠 Carrie: {', '.join(dispatch_results['carrie'])}")
+        if dispatch_results["conan"]:
+            dispatched.append(f"☁️ Conan: {', '.join(dispatch_results['conan'])}")
+        
+        dispatch_text = "\n".join(dispatched) if dispatched else "⚠️ 無目標 bot"
+        error_text = f"\n❌ 錯誤: {', '.join(dispatch_results['errors'])}" if dispatch_results["errors"] else ""
+        
+        await processing_msg.edit_text(
+            f"✅ 分析完成！\n\n"
+            f"📤 已轉發指令：\n{dispatch_text}{error_text}\n\n"
+            f"🆔 Session: {session_id}",
+        )
         
     except Exception as e:
         logger.error(f"處理訊息錯誤: {e}")
