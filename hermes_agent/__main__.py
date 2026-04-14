@@ -176,6 +176,75 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(help_text)
 
 
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/diag 診斷所有通道"""
+    msg = await update.message.reply_text("🔍 診斷中...")
+    results = []
+    
+    # 1. LLM API
+    try:
+        r = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=5,
+        )
+        results.append(f"✅ LLM ({OPENAI_MODEL}): OK")
+    except Exception as e:
+        results.append(f"❌ LLM: {str(e)[:80]}")
+    
+    # 2. Carrie bot token
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.telegram.org/bot{CARRIE_BOT_TOKEN}/getMe") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results.append(f"✅ Carrie Token: @{data['result']['username']}")
+                else:
+                    results.append(f"❌ Carrie Token: HTTP {resp.status}")
+    except Exception as e:
+        results.append(f"❌ Carrie Token: {str(e)[:80]}")
+    
+    # 3. Conan bot token
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.telegram.org/bot{CONAN_BOT_TOKEN}/getMe") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    results.append(f"✅ Conan Token: @{data['result']['username']}")
+                else:
+                    results.append(f"❌ Conan Token: HTTP {resp.status}")
+    except Exception as e:
+        results.append(f"❌ Conan Token: {str(e)[:80]}")
+    
+    # 4. n8n webhook
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(N8N_WEBHOOK_URL, data="ping", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                results.append(f"{'✅' if resp.status == 200 else '⚠️'} n8n Webhook: HTTP {resp.status}")
+    except Exception as e:
+        results.append(f"❌ n8n Webhook: {str(e)[:80]}")
+    
+    # 5. Dispatch chat_id 測試（用 Carrie token 發測試訊息）
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.telegram.org/bot{CARRIE_BOT_TOKEN}/sendMessage",
+                json={"chat_id": DISPATCH_CHAT_ID, "text": "🔧 [diag] Sherlock → Carrie 通道測試"}
+            ) as resp:
+                if resp.status == 200:
+                    results.append(f"✅ Carrie 轉發 (chat {DISPATCH_CHAT_ID}): OK")
+                else:
+                    err = await resp.text()
+                    results.append(f"❌ Carrie 轉發: {err[:100]}")
+    except Exception as e:
+        results.append(f"❌ Carrie 轉發: {str(e)[:80]}")
+    
+    await msg.edit_text(
+        f"🔍 Sherlock 診斷報告\n\n" + "\n".join(results) +
+        f"\n\n📊 分析次數: {len(recent_analyses)}"
+    )
+
+
 async def analyze_with_llm(text: str, session_id: str) -> str:
     """使用 LLM 分析輸入並產出 JSONL"""
     try:
@@ -353,6 +422,7 @@ async def main_async():
     # 添加 handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("diag", diag_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # 啟動 Telegram Bot
