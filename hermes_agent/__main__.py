@@ -224,20 +224,21 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         results.append(f"❌ n8n Webhook: {str(e)[:80]}")
     
-    # 5. Dispatch chat_id 測試（用 Carrie token 發測試訊息）
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://api.telegram.org/bot{CARRIE_BOT_TOKEN}/sendMessage",
-                json={"chat_id": DISPATCH_CHAT_ID, "text": "🔧 [diag] Sherlock → Carrie 通道測試"}
-            ) as resp:
-                if resp.status == 200:
-                    results.append(f"✅ Carrie 轉發 (chat {DISPATCH_CHAT_ID}): OK")
-                else:
-                    err = await resp.text()
-                    results.append(f"❌ Carrie 轉發: {err[:100]}")
-    except Exception as e:
-        results.append(f"❌ Carrie 轉發: {str(e)[:80]}")
+    # 5. Dispatch chat_id 測試（Carrie + Conan）
+    for name, token in [("Carrie", CARRIE_BOT_TOKEN), ("Conan", CONAN_BOT_TOKEN)]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": DISPATCH_CHAT_ID, "text": f"🔧 [diag] Sherlock → {name} 通道測試"}
+                ) as resp:
+                    if resp.status == 200:
+                        results.append(f"✅ {name} 轉發 (chat {DISPATCH_CHAT_ID}): OK")
+                    else:
+                        err = await resp.text()
+                        results.append(f"❌ {name} 轉發: {err[:100]}")
+        except Exception as e:
+            results.append(f"❌ {name} 轉發: {str(e)[:80]}")
     
     await msg.edit_text(
         f"🔍 Sherlock 診斷報告\n\n" + "\n".join(results) +
