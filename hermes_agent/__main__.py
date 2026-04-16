@@ -255,17 +255,18 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         results.append(f"❌ n8n Webhook: {str(e)[:80]}")
     
-    # 5. Carrie webhook（主通道）
+    # 5. Carrie webhook（透過 n8n 轉發，用 POST 測試）
     try:
+        test_jsonl = '{"schema":"sherlock/v1","type":"action","target":"carrie","action_type":"ping","payload":{}}'
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                CARRIE_WEBHOOK_URL.replace("/webhook/dispatch", "/health"),
-                timeout=aiohttp.ClientTimeout(total=10)
+            async with session.post(
+                CARRIE_WEBHOOK_URL,
+                headers={"Content-Type": "text/plain", "X-Webhook-Secret": CARRIE_WEBHOOK_SECRET},
+                data=test_jsonl,
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    vaults = data.get("vaults", [])
-                    results.append(f"✅ Carrie Webhook: OK ({len(vaults)} vaults)")
+                    results.append(f"✅ Carrie Webhook: OK (via n8n relay)")
                 else:
                     results.append(f"⚠️ Carrie Webhook: HTTP {resp.status}")
     except Exception as e:
