@@ -54,6 +54,10 @@ client = AsyncOpenAI(
 # 儲存最近的分析結果
 recent_analyses = []
 
+# ── 離線佇列（Home 離線時暫存 JSONL）──
+pending_queue = []  # list of {"ts": str, "session_id": str, "jsonl": str}
+MAX_QUEUE_SIZE = 100
+
 # System Prompt
 SYSTEM_PROMPT = """你是 Sherlock，一個專業的分析偵探 AI。
 
@@ -162,18 +166,52 @@ async def web_health(request):
     return web.json_response({"status": "ok", "service": "hermes-agent"})
 
 
+# ── 佇列 API（Carrie 上線後拉取）──
+
+QUEUE_SECRET = os.getenv("QUEUE_SECRET", CARRIE_WEBHOOK_SECRET)
+
+
+async def api_queue_peek(request):
+    """GET /api/queue — 查看佇列（不刪除）"""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != QUEUE_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return web.json_response({
+        "count": len(pending_queue),
+        "items": pending_queue,
+    })
+
+
+async def api_queue_drain(request):
+    """POST /api/queue/drain — 取出所有佇列項目（清空佇列）"""
+    secret = request.headers.get("X-Webhook-Secret", "")
+    if secret != QUEUE_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    items = list(pending_queue)
+    pending_queue.clear()
+    logger.info(f"📤 佇列已被 drain: {len(items)} 筆")
+    return web.json_response({
+        "drained": len(items),
+        "items": items,
+    })
+
+
 async def start_web_server():
     """啟動 Web Server"""
     app = web.Application()
     app.router.add_get('/', web_index)
     app.router.add_get('/api/status', web_api_status)
     app.router.add_get('/health', web_health)
+    app.router.add_get('/api/queue', api_queue_peek)
+    app.router.add_post('/api/queue/drain', api_queue_drain)
     
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', WEB_PORT)
     await site.start()
     logger.info(f"🌐 Web UI 已啟動: http://0.0.0.0:{WEB_PORT}")
+    logger.info(f"   GET  /api/queue — 查看離線佇列")
+    logger.info(f"   POST /api/queue/drain — 取出並清空佇列")
 
 
 # ========== Telegram Bot Handlers ==========
@@ -274,9 +312,10 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     await msg.edit_text(
         f"🔍 Sherlock 診斷報告\n\n" + "\n".join(results) +
-        f"\n\n📡 Dispatch: webhook → n8n (fallback)"
+        f"\n\n📡 Dispatch: webhook → 離線佇列 (fallback)"
         f"\n🌐 Carrie: {CARRIE_WEBHOOK_URL}"
-        f"\n📊 分析次數: {len(recent_analyses)}"
+        f"\n📦 離線佇列: {len(pending_queue)} 筆待處理"
+        f"\n 分析次數: {len(recent_analyses)}"
     )
 
 
@@ -372,28 +411,21 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
     except Exception as e:
         logger.warning(f"⚠️ Carrie webhook 不可達: {e}")
     
-    # ── Fallback：n8n webhook ──
+    # ── Fallback：存入離線佇列 ──
     if not webhook_ok:
-        logger.info("📡 Fallback → n8n webhook")
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    N8N_WEBHOOK_URL,
-                    headers={"Content-Type": "text/plain", "X-Session-Id": session_id},
-                    data=carrie_payload,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 200:
-                        results["channel"] = "n8n"
-                        logger.info(f"✅ n8n fallback 成功")
-                    else:
-                        results["channel"] = "failed"
-                        results["errors"].append(f"n8n: {resp.status}")
-                        logger.error(f"❌ n8n fallback 也失敗: {resp.status}")
-        except Exception as e:
-            results["channel"] = "failed"
-            results["errors"].append(f"n8n: {str(e)[:80]}")
-            logger.error(f"❌ n8n fallback 異常: {e}")
+        logger.info("📦 Home 離線，存入佇列")
+        if len(pending_queue) < MAX_QUEUE_SIZE:
+            pending_queue.append({
+                "ts": datetime.now().isoformat(),
+                "session_id": session_id,
+                "jsonl": carrie_payload,
+            })
+            results["channel"] = "queued"
+            logger.info(f"📦 已加入佇列 (共 {len(pending_queue)} 筆待處理)")
+        else:
+            results["channel"] = "queue_full"
+            results["errors"].append("queue_full")
+            logger.error(f"❌ 佇列已滿 ({MAX_QUEUE_SIZE})")
     
     return results
 
@@ -445,7 +477,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         # 組裝結果訊息
         channel = dispatch_results.get("channel", "none")
-        channel_emoji = {"webhook": "🌐", "n8n": "📡", "failed": "❌", "none": "⚠️"}.get(channel, "❓")
+        channel_emoji = {"webhook": "🌐", "n8n": "📡", "queued": "📦", "queue_full": "🚫", "failed": "❌", "none": "⚠️"}.get(channel, "❓")
         
         dispatched = []
         if dispatch_results["carrie"]:
