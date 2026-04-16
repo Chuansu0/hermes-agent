@@ -33,10 +33,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "kimi-k2.5")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n.neovega.cc/webhook/sherlock-output")
 WEB_PORT = int(os.getenv("PORT", "8080"))
 
-# Bot tokens 與 chat_id 設定（用於直接轉發 JSONL）
+# Bot tokens（僅用於 /diag 驗證）
 CARRIE_BOT_TOKEN = os.getenv("CARRIE_BOT_TOKEN", "8615424711:AAGLoHijlMpqWX7yD_JhJjKeTS0Dd5H5GTg")
 CONAN_BOT_TOKEN = os.getenv("CONAN_BOT_TOKEN", "8622712926:AAFjLECd5xFxeveZAlRDmqLyFN3sXRIfpvg")
-# 發送者的 chat_id（Sherlock 用對方 bot token 發訊息給這個 chat）
+# Dispatch 群組 chat_id（Sherlock 用自己的 token 發到群組，Carrie/Conan 在群組中接收）
+# 使用者需建立群組並將三個 bot 加入，然後填入群組 chat_id
+DISPATCH_GROUP_ID = int(os.getenv("DISPATCH_GROUP_ID", "0"))
+# 舊的私聊 chat_id（備用通知用）
 DISPATCH_CHAT_ID = int(os.getenv("DISPATCH_CHAT_ID", "8240891231"))
 
 # 初始化 OpenAI 客戶端
@@ -312,15 +315,21 @@ async def send_to_n8n(jsonl_data: str, session_id: str) -> bool:
 
 
 async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
-    """直接透過 Telegram Bot API 轉發 JSONL 給 Carrie/Conan"""
+    """透過 Telegram 群組轉發 JSONL 給 Carrie/Conan
+    
+    架構：Sherlock 用自己的 token 發到 dispatch 群組，
+    Carrie/Conan 在群組中透過 polling 接收並過濾 from_user.id == Sherlock bot ID。
+    
+    如果 DISPATCH_GROUP_ID 未設定（=0），fallback 到私聊通知使用者。
+    """
     results = {"carrie": [], "conan": [], "errors": []}
     
-    bot_tokens = {
-        "aria": CARRIE_BOT_TOKEN,
-        "carrie": CARRIE_BOT_TOKEN,
-        "conan": CONAN_BOT_TOKEN,
-        "all": None,  # 廣播
-    }
+    # 決定發送目標：優先群組，fallback 私聊
+    chat_id = DISPATCH_GROUP_ID if DISPATCH_GROUP_ID != 0 else DISPATCH_CHAT_ID
+    use_group = DISPATCH_GROUP_ID != 0
+    
+    if not use_group:
+        logger.warning("⚠️ DISPATCH_GROUP_ID 未設定，使用私聊 fallback（Carrie 可能無法接收）")
     
     for line in jsonl_lines:
         try:
@@ -329,33 +338,37 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
                 continue
             
             target = obj.get("target", "")
-            targets_to_send = []
-            
+            # 記錄目標 bot 名稱
+            target_names = []
             if target == "all":
-                targets_to_send = [("carrie", CARRIE_BOT_TOKEN), ("conan", CONAN_BOT_TOKEN)]
+                target_names = ["carrie", "conan"]
             elif target in ("aria", "carrie"):
-                targets_to_send = [("carrie", CARRIE_BOT_TOKEN)]
+                target_names = ["carrie"]
             elif target == "conan":
-                targets_to_send = [("conan", CONAN_BOT_TOKEN)]
+                target_names = ["conan"]
             
-            for bot_name, bot_token in targets_to_send:
-                try:
-                    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url, json={
-                            "chat_id": DISPATCH_CHAT_ID,
-                            "text": line,
-                        }) as resp:
-                            if resp.status == 200:
-                                results[bot_name].append(obj.get("action_type", "unknown"))
-                                logger.info(f"✅ 已轉發給 {bot_name}: {obj.get('action_type')}")
-                            else:
-                                err = await resp.text()
-                                results["errors"].append(f"{bot_name}: {resp.status}")
-                                logger.error(f"轉發給 {bot_name} 失敗: {err}")
-                except Exception as e:
-                    results["errors"].append(f"{bot_name}: {str(e)}")
-                    logger.error(f"轉發給 {bot_name} 異常: {e}")
+            if not target_names:
+                continue
+            
+            # 用 Sherlock 自己的 token 發送到群組（一次發送，所有 bot 都能看到）
+            try:
+                url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json={
+                        "chat_id": chat_id,
+                        "text": line,
+                    }) as resp:
+                        if resp.status == 200:
+                            for name in target_names:
+                                results[name].append(obj.get("action_type", "unknown"))
+                            logger.info(f"✅ 已發送到{'群組' if use_group else '私聊'}: {obj.get('action_type')} → {target_names}")
+                        else:
+                            err = await resp.text()
+                            results["errors"].append(f"dispatch: {resp.status}")
+                            logger.error(f"發送失敗: {err}")
+            except Exception as e:
+                results["errors"].append(f"dispatch: {str(e)}")
+                logger.error(f"發送異常: {e}")
         except json.JSONDecodeError:
             continue
     
