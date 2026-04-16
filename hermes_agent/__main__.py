@@ -33,14 +33,17 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "kimi-k2.5")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n.neovega.cc/webhook/sherlock-output")
 WEB_PORT = int(os.getenv("PORT", "8080"))
 
-# Bot tokens（僅用於 /diag 驗證）
+# Bot tokens（僅用於 /diag 驗證與通知）
 CARRIE_BOT_TOKEN = os.getenv("CARRIE_BOT_TOKEN", "8615424711:AAGLoHijlMpqWX7yD_JhJjKeTS0Dd5H5GTg")
 CONAN_BOT_TOKEN = os.getenv("CONAN_BOT_TOKEN", "8622712926:AAFjLECd5xFxeveZAlRDmqLyFN3sXRIfpvg")
-# Dispatch 群組 chat_id（Sherlock 用自己的 token 發到群組，Carrie/Conan 在群組中接收）
-# 使用者需建立群組並將三個 bot 加入，然後填入群組 chat_id
-DISPATCH_GROUP_ID = int(os.getenv("DISPATCH_GROUP_ID", "0"))
-# 舊的私聊 chat_id（備用通知用）
+# 使用者 chat_id（用於 Telegram 通知）
 DISPATCH_CHAT_ID = int(os.getenv("DISPATCH_CHAT_ID", "8240891231"))
+
+# Carrie webhook（主要通道：HTTP POST JSONL）
+# 方案 A: 直接連 Carrie（需 tunnel 開 18791 port）
+# 方案 B: 透過 home-n8n 轉發（n8n workflow 收到後 POST 到 localhost:18791）
+CARRIE_WEBHOOK_URL = os.getenv("CARRIE_WEBHOOK_URL", "https://home-n8n.neovega.cc/webhook/carrie-dispatch")
+CARRIE_WEBHOOK_SECRET = os.getenv("CARRIE_WEBHOOK_SECRET", "hermes-carrie-2026")
 
 # 初始化 OpenAI 客戶端
 client = AsyncOpenAI(
@@ -252,25 +255,27 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         results.append(f"❌ n8n Webhook: {str(e)[:80]}")
     
-    # 5. Dispatch chat_id 測試（Carrie + Conan）
-    for name, token in [("Carrie", CARRIE_BOT_TOKEN), ("Conan", CONAN_BOT_TOKEN)]:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": DISPATCH_CHAT_ID, "text": f"🔧 [diag] Sherlock → {name} 通道測試"}
-                ) as resp:
-                    if resp.status == 200:
-                        results.append(f"✅ {name} 轉發 (chat {DISPATCH_CHAT_ID}): OK")
-                    else:
-                        err = await resp.text()
-                        results.append(f"❌ {name} 轉發: {err[:100]}")
-        except Exception as e:
-            results.append(f"❌ {name} 轉發: {str(e)[:80]}")
+    # 5. Carrie webhook（主通道）
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                CARRIE_WEBHOOK_URL.replace("/webhook/dispatch", "/health"),
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    vaults = data.get("vaults", [])
+                    results.append(f"✅ Carrie Webhook: OK ({len(vaults)} vaults)")
+                else:
+                    results.append(f"⚠️ Carrie Webhook: HTTP {resp.status}")
+    except Exception as e:
+        results.append(f"❌ Carrie Webhook: {str(e)[:80]}")
     
     await msg.edit_text(
         f"🔍 Sherlock 診斷報告\n\n" + "\n".join(results) +
-        f"\n\n📊 分析次數: {len(recent_analyses)}"
+        f"\n\n📡 Dispatch: webhook → n8n (fallback)"
+        f"\n🌐 Carrie: {CARRIE_WEBHOOK_URL}"
+        f"\n📊 分析次數: {len(recent_analyses)}"
     )
 
 
@@ -315,62 +320,79 @@ async def send_to_n8n(jsonl_data: str, session_id: str) -> bool:
 
 
 async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
-    """透過 Telegram 群組轉發 JSONL 給 Carrie/Conan
+    """兩段式 dispatch：webhook → (fallback) → n8n
     
-    架構：Sherlock 用自己的 token 發到 dispatch 群組，
-    Carrie/Conan 在群組中透過 polling 接收並過濾 from_user.id == Sherlock bot ID。
-    
-    如果 DISPATCH_GROUP_ID 未設定（=0），fallback 到私聊通知使用者。
+    1. 主通道：HTTP POST 到 Carrie webhook（Home Workstation）
+    2. Fallback：HTTP POST 到 n8n webhook（Zeabur n8n 轉發）
+    3. 通知：用 Sherlock token 發 Telegram 通知給使用者
     """
-    results = {"carrie": [], "conan": [], "errors": []}
+    results = {"carrie": [], "conan": [], "errors": [], "channel": "none"}
     
-    # 決定發送目標：優先群組，fallback 私聊
-    chat_id = DISPATCH_GROUP_ID if DISPATCH_GROUP_ID != 0 else DISPATCH_CHAT_ID
-    use_group = DISPATCH_GROUP_ID != 0
-    
-    if not use_group:
-        logger.warning("⚠️ DISPATCH_GROUP_ID 未設定，使用私聊 fallback（Carrie 可能無法接收）")
-    
+    # 收集 carrie 的 action lines
+    carrie_lines = []
     for line in jsonl_lines:
         try:
             obj = json.loads(line)
             if obj.get("type") != "action":
                 continue
-            
             target = obj.get("target", "")
-            # 記錄目標 bot 名稱
-            target_names = []
-            if target == "all":
-                target_names = ["carrie", "conan"]
-            elif target in ("aria", "carrie"):
-                target_names = ["carrie"]
-            elif target == "conan":
-                target_names = ["conan"]
-            
-            if not target_names:
-                continue
-            
-            # 用 Sherlock 自己的 token 發送到群組（一次發送，所有 bot 都能看到）
-            try:
-                url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json={
-                        "chat_id": chat_id,
-                        "text": line,
-                    }) as resp:
-                        if resp.status == 200:
-                            for name in target_names:
-                                results[name].append(obj.get("action_type", "unknown"))
-                            logger.info(f"✅ 已發送到{'群組' if use_group else '私聊'}: {obj.get('action_type')} → {target_names}")
-                        else:
-                            err = await resp.text()
-                            results["errors"].append(f"dispatch: {resp.status}")
-                            logger.error(f"發送失敗: {err}")
-            except Exception as e:
-                results["errors"].append(f"dispatch: {str(e)}")
-                logger.error(f"發送異常: {e}")
+            if target in ("aria", "carrie", "all"):
+                carrie_lines.append(line)
+                results["carrie"].append(obj.get("action_type", "unknown"))
         except json.JSONDecodeError:
             continue
+    
+    if not carrie_lines:
+        return results
+    
+    carrie_payload = "\n".join(carrie_lines)
+    
+    # ── 主通道：Carrie webhook ──
+    webhook_ok = False
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                CARRIE_WEBHOOK_URL,
+                headers={
+                    "Content-Type": "text/plain",
+                    "X-Webhook-Secret": CARRIE_WEBHOOK_SECRET,
+                    "X-Session-Id": session_id,
+                },
+                data=carrie_payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    webhook_ok = True
+                    results["channel"] = "webhook"
+                    logger.info(f"✅ Carrie webhook 成功: {resp.status}")
+                else:
+                    err = await resp.text()
+                    logger.warning(f"⚠️ Carrie webhook 失敗 ({resp.status}): {err[:100]}")
+    except Exception as e:
+        logger.warning(f"⚠️ Carrie webhook 不可達: {e}")
+    
+    # ── Fallback：n8n webhook ──
+    if not webhook_ok:
+        logger.info("📡 Fallback → n8n webhook")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    N8N_WEBHOOK_URL,
+                    headers={"Content-Type": "text/plain", "X-Session-Id": session_id},
+                    data=carrie_payload,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        results["channel"] = "n8n"
+                        logger.info(f"✅ n8n fallback 成功")
+                    else:
+                        results["channel"] = "failed"
+                        results["errors"].append(f"n8n: {resp.status}")
+                        logger.error(f"❌ n8n fallback 也失敗: {resp.status}")
+        except Exception as e:
+            results["channel"] = "failed"
+            results["errors"].append(f"n8n: {str(e)[:80]}")
+            logger.error(f"❌ n8n fallback 異常: {e}")
     
     return results
 
@@ -417,13 +439,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await processing_msg.edit_text(f"⚠️ 無法產出 JSONL 指令\n\nLLM 回應:\n{llm_response[:500]}")
             return
         
-        # 直接轉發 JSONL 給 Carrie/Conan（主要通道）
+        # 兩段式 dispatch：webhook → n8n fallback
         dispatch_results = await dispatch_to_bots(jsonl_lines, session_id)
         
-        # 也嘗試發送到 n8n（備用/記錄用）
-        await send_to_n8n(jsonl_data, session_id)
-        
         # 組裝結果訊息
+        channel = dispatch_results.get("channel", "none")
+        channel_emoji = {"webhook": "🌐", "n8n": "📡", "failed": "❌", "none": "⚠️"}.get(channel, "❓")
+        
         dispatched = []
         if dispatch_results["carrie"]:
             dispatched.append(f"🏠 Carrie: {', '.join(dispatch_results['carrie'])}")
@@ -435,7 +457,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         await processing_msg.edit_text(
             f"✅ 分析完成！\n\n"
-            f"📤 已轉發指令：\n{dispatch_text}{error_text}\n\n"
+            f"📤 已轉發指令：\n{dispatch_text}\n"
+            f"{channel_emoji} 通道: {channel}{error_text}\n\n"
             f"🆔 Session: {session_id}",
         )
         
