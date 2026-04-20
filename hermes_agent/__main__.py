@@ -6,6 +6,7 @@ Hermes Agent - neovegasherlock_bot
 """
 
 import os
+import re
 import json
 import asyncio
 import logging
@@ -58,10 +59,81 @@ recent_analyses = []
 pending_queue = []  # list of {"ts": str, "session_id": str, "jsonl": str}
 MAX_QUEUE_SIZE = 100
 
-# System Prompt
-SYSTEM_PROMPT = """你是 Sherlock，一個專業的分析偵探 AI。
+# ── 意圖分類 ──
+# 三種意圖：archive（存檔→轉發 Carrie）、learn（學習→直接回答）、analyze（分析→直接回答）
+INTENT_ARCHIVE = "archive"
+INTENT_LEARN = "learn"
+INTENT_ANALYZE = "analyze"
 
-當你完成分析後，必須在回覆末尾附上 JSONL 格式的結構化指令，每行一個 JSON 物件。
+# 關鍵字規則（優先順序：存檔 > 分析 > 學習）
+_ARCHIVE_KEYWORDS = [
+	"存", "收藏", "入庫", "save", "ingest", "備份", "下載", "歸檔",
+	"存起來", "收起來", "存到", "加入知識庫", "加到vault",
+	"local_scan", "run_script", "執行腳本", "掃描",
+]
+_ANALYZE_KEYWORDS = [
+	"分析", "比較", "整理", "統整", "歸納", "evaluate", "analyze",
+	"幫我看看", "優缺點", "差異", "對比", "review", "評估",
+]
+_LEARN_KEYWORDS = [
+	"是什麼", "什麼是", "解釋", "說明", "介紹", "教我", "怎麼用",
+	"這篇在講", "在說什麼", "重點是", "摘要", "summarize", "explain",
+	"what is", "how to", "tell me about", "幫我讀", "幫我看",
+]
+
+# URL 正規表達式
+_URL_PATTERN = re.compile(r'https?://\S+')
+
+
+def classifyIntent(text: str) -> str:
+	"""規則式意圖分類器。
+	
+	判斷邏輯：
+	1. 有明確存檔關鍵字 → archive
+	2. 有分析關鍵字 → analyze
+	3. 有學習/提問關鍵字 → learn
+	4. 純 URL（無其他文字）→ archive（向後相容）
+	5. 有 URL + 無明確意圖 → learn（預設不入庫，先解讀）
+	6. 純文字無 URL → learn
+	"""
+	lower = text.lower().strip()
+	has_url = bool(_URL_PATTERN.search(lower))
+	# 去掉 URL 後的純文字部分
+	text_without_url = _URL_PATTERN.sub("", lower).strip()
+
+	# 1. 存檔關鍵字
+	for kw in _ARCHIVE_KEYWORDS:
+		if kw in lower:
+			return INTENT_ARCHIVE
+
+	# 2. 分析關鍵字
+	for kw in _ANALYZE_KEYWORDS:
+		if kw in lower:
+			return INTENT_ANALYZE
+
+	# 3. 學習/提問關鍵字
+	for kw in _LEARN_KEYWORDS:
+		if kw in lower:
+			return INTENT_LEARN
+
+	# 4. 純 URL（幾乎沒有其他文字）→ 向後相容，預設存檔
+	if has_url and len(text_without_url) < 5:
+		return INTENT_ARCHIVE
+
+	# 5. 有 URL 但沒有明確意圖 → 預設先解讀，不入庫
+	if has_url:
+		return INTENT_LEARN
+
+	# 6. 純文字 → 學習/對話
+	return INTENT_LEARN
+
+
+# ── 各意圖的 System Prompt ──
+
+SYSTEM_PROMPT_ARCHIVE = """你是 Sherlock，一個專業的分析偵探 AI。
+使用者要求你將內容存檔或執行本地動作。
+
+你必須在回覆末尾附上 JSONL 格式的結構化指令，每行一個 JSON 物件。
 
 格式規範：
 - 第一行：type=analysis，包含摘要與信心度
@@ -97,16 +169,34 @@ SYSTEM_PROMPT = """你是 Sherlock，一個專業的分析偵探 AI。
 {"schema":"sherlock/v1","ts":"2026-04-16T12:00:00Z","session":"abc123","type":"analysis","summary":"使用者要求入庫冥想相關文章到身心靈 vault","confidence":0.95}
 {"schema":"sherlock/v1","ts":"2026-04-16T12:00:00Z","session":"abc123","type":"action","target":"carrie","action_type":"ingest_url","payload":{"url":"https://example.com/meditation","vault":"wellbeing"}}
 
-範例 — 使用者說「存這個 AI 論文 https://arxiv.org/xxx」：
-{"schema":"sherlock/v1","ts":"2026-04-16T12:00:00Z","session":"abc123","type":"analysis","summary":"AI 論文入庫到研發 vault","confidence":0.95}
-{"schema":"sherlock/v1","ts":"2026-04-16T12:00:00Z","session":"abc123","type":"action","target":"carrie","action_type":"ingest_url","payload":{"url":"https://arxiv.org/xxx","vault":"rnd"}}
-
 請確保：
 1. 所有 JSON 物件符合 sherlock/v1 schema
 2. ts 欄位為 ISO8601 格式
 3. session 欄位使用唯一 ID
 4. target 欄位正確指定 bot
 5. ingest_url 的 payload 必須包含 vault 欄位
+"""
+
+SYSTEM_PROMPT_LEARN = """你是 Sherlock，一個專業的分析偵探 AI。
+使用者想要了解或學習某個主題。請直接用繁體中文回答。
+
+規則：
+- 直接回答使用者的問題，提供清晰易懂的解釋
+- 如果訊息包含 URL，請根據 URL 的內容（從網域名和路徑推測）提供你所知的相關資訊
+- 不要產生 JSONL 指令，不要轉發給其他 bot
+- 回答要有結構、有重點，適當使用條列式
+- 如果使用者之後想存檔，可以提示他說「存起來」或「入庫」
+"""
+
+SYSTEM_PROMPT_ANALYZE = """你是 Sherlock，一個專業的分析偵探 AI。
+使用者要求你進行深度分析。請直接用繁體中文回答。
+
+規則：
+- 提供結構化的分析結果（優缺點、比較表、風險評估等）
+- 如果訊息包含 URL，請根據 URL 的內容推測並分析
+- 不要產生 JSONL 指令，不要轉發給其他 bot
+- 分析要客觀、有深度，列出關鍵發現
+- 結尾可以建議使用者是否要將分析結果存檔到知識庫
 """
 
 
@@ -319,13 +409,13 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def analyze_with_llm(text: str, session_id: str) -> str:
-    """使用 LLM 分析輸入並產出 JSONL"""
+async def analyze_with_llm(text: str, session_id: str, system_prompt: str = SYSTEM_PROMPT_ARCHIVE) -> str:
+    """使用 LLM 分析輸入，根據意圖使用不同 system prompt"""
     try:
         response = await client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
             temperature=0.7,
@@ -431,69 +521,114 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """處理用戶訊息"""
+    """處理用戶訊息 — 先分類意圖，再決定路由"""
     if not update.message or not update.message.text:
         return
     
     user_text = update.message.text
     session_id = f"sess_{datetime.now().strftime('%Y%m%d%H%M%S')}_{update.message.message_id}"
     
+    # 意圖分類
+    intent = classifyIntent(user_text)
+    intent_emoji = {
+        INTENT_ARCHIVE: "📦", INTENT_LEARN: "📖", INTENT_ANALYZE: "🔬",
+    }.get(intent, "❓")
+    intent_label = {
+        INTENT_ARCHIVE: "存檔", INTENT_LEARN: "學習", INTENT_ANALYZE: "分析",
+    }.get(intent, "未知")
+    
+    logger.info(f"意圖分類: {intent} | 訊息: {user_text[:80]}...")
+    
     # 儲存到最近分析列表
     recent_analyses.append({
         "session_id": session_id,
         "text": user_text[:100],
-        "timestamp": datetime.now().isoformat()
+        "intent": intent,
+        "timestamp": datetime.now().isoformat(),
     })
-    # 只保留最近 10 條
     if len(recent_analyses) > 10:
         recent_analyses.pop(0)
     
-    # 顯示分析中
-    processing_msg = await update.message.reply_text("🔍 Sherlock 分析中...")
+    # 顯示處理中（含意圖標籤）
+    processing_msg = await update.message.reply_text(
+        f"{intent_emoji} Sherlock 處理中... (意圖: {intent_label})"
+    )
     
     try:
-        # 使用 LLM 分析
-        llm_response = await analyze_with_llm(user_text, session_id)
+        # 根據意圖選擇 system prompt
+        prompt_map = {
+            INTENT_ARCHIVE: SYSTEM_PROMPT_ARCHIVE,
+            INTENT_LEARN: SYSTEM_PROMPT_LEARN,
+            INTENT_ANALYZE: SYSTEM_PROMPT_ANALYZE,
+        }
+        system_prompt = prompt_map.get(intent, SYSTEM_PROMPT_LEARN)
+        
+        # 呼叫 LLM
+        llm_response = await analyze_with_llm(user_text, session_id, system_prompt)
         
         if not llm_response:
             await processing_msg.edit_text("❌ 分析失敗，請稍後再試")
             return
         
-        # 提取 JSONL 部分（假設在最後）
-        jsonl_lines = []
-        for line in llm_response.split('\n'):
-            line = line.strip()
-            if line.startswith('{'):
-                jsonl_lines.append(line)
+        # ── 存檔意圖：提取 JSONL 並轉發給 Carrie ──
+        if intent == INTENT_ARCHIVE:
+            jsonl_lines = []
+            non_jsonl_lines = []
+            for line in llm_response.split('\n'):
+                stripped = line.strip()
+                if stripped.startswith('{'):
+                    jsonl_lines.append(stripped)
+                else:
+                    non_jsonl_lines.append(line)
+            
+            # LLM 的文字說明部分
+            llm_text = '\n'.join(non_jsonl_lines).strip()
+            
+            if not jsonl_lines:
+                await processing_msg.edit_text(
+                    f"⚠️ 無法產出存檔指令\n\n{llm_response[:500]}"
+                )
+                return
+            
+            # 轉發給 Carrie
+            dispatch_results = await dispatch_to_bots(jsonl_lines, session_id)
+            
+            channel = dispatch_results.get("channel", "none")
+            channel_emoji = {
+                "webhook": "🌐", "n8n": "📡", "queued": "📦",
+                "queue_full": "🚫", "failed": "❌", "none": "⚠️",
+            }.get(channel, "❓")
+            
+            dispatched = []
+            if dispatch_results["carrie"]:
+                dispatched.append(f"🏠 Carrie: {', '.join(dispatch_results['carrie'])}")
+            if dispatch_results["conan"]:
+                dispatched.append(f"☁️ Conan: {', '.join(dispatch_results['conan'])}")
+            
+            dispatch_text = "\n".join(dispatched) if dispatched else "⚠️ 無目標 bot"
+            errors = dispatch_results.get("errors", [])
+            error_text = f"\n❌ 錯誤: {', '.join(errors)}" if errors else ""
+            
+            # 組裝回覆：簡短說明 + dispatch 結果
+            reply_parts = [f"📦 存檔指令已發送！"]
+            if llm_text:
+                reply_parts.append(f"\n{llm_text[:300]}")
+            reply_parts.append(f"\n📤 轉發：\n{dispatch_text}")
+            reply_parts.append(f"{channel_emoji} 通道: {channel}{error_text}")
+            reply_parts.append(f"🆔 {session_id}")
+            
+            await processing_msg.edit_text("\n".join(reply_parts))
         
-        jsonl_data = '\n'.join(jsonl_lines)
-        
-        if not jsonl_data:
-            await processing_msg.edit_text(f"⚠️ 無法產出 JSONL 指令\n\nLLM 回應:\n{llm_response[:500]}")
-            return
-        
-        # 兩段式 dispatch：webhook → n8n fallback
-        dispatch_results = await dispatch_to_bots(jsonl_lines, session_id)
-        
-        # 組裝結果訊息
-        channel = dispatch_results.get("channel", "none")
-        channel_emoji = {"webhook": "🌐", "n8n": "📡", "queued": "📦", "queue_full": "🚫", "failed": "❌", "none": "⚠️"}.get(channel, "❓")
-        
-        dispatched = []
-        if dispatch_results["carrie"]:
-            dispatched.append(f"🏠 Carrie: {', '.join(dispatch_results['carrie'])}")
-        if dispatch_results["conan"]:
-            dispatched.append(f"☁️ Conan: {', '.join(dispatch_results['conan'])}")
-        
-        dispatch_text = "\n".join(dispatched) if dispatched else "⚠️ 無目標 bot"
-        error_text = f"\n❌ 錯誤: {', '.join(dispatch_results['errors'])}" if dispatch_results["errors"] else ""
-        
-        await processing_msg.edit_text(
-            f"✅ 分析完成！\n\n"
-            f"📤 已轉發指令：\n{dispatch_text}\n"
-            f"{channel_emoji} 通道: {channel}{error_text}\n\n"
-            f"🆔 Session: {session_id}",
-        )
+        # ── 學習 / 分析意圖：直接回覆，不轉發 ──
+        else:
+            # 截斷過長回覆（Telegram 訊息上限 4096）
+            reply = llm_response[:3900]
+            footer = f"\n\n{intent_emoji} 意圖: {intent_label}"
+            # 提示使用者可以存檔
+            if _URL_PATTERN.search(user_text):
+                footer += "\n💡 想存檔？回覆「存起來」即可入庫"
+            
+            await processing_msg.edit_text(reply + footer)
         
     except Exception as e:
         logger.error(f"處理訊息錯誤: {e}")
