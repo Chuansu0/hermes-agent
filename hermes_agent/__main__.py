@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # 設定
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8505666076:AAFsPUQCBA7UVdIiw8ItBU3QHDbggI6Payg")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-NQXHpmDhh4SHISdAtMtFEGCcbkJjYEWKQ6xolQbPygsfcrtX6F7wBFYC9bSryTDw")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-GtiZARPf7Ao8VxoSzz9HAeDbOytMCqX4kLY5WrmBYpFpXGN3eOETyw1FftwB5U6A")
 OPENAI_BASE_URL = os.getenv("OPENAI_API_BASE", "https://opencode.ai/zen/go/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "kimi-k2.5")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n.neovega.cc/webhook/sherlock-output")

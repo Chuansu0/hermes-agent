@@ -2,7 +2,7 @@
 # 此檔案由 Zeabur configs 注入到 /opt/data/.env
 
 # LLM Provider (OpenAI-compatible custom endpoint)
-OPENAI_API_KEY=sk-NQXHpmDhh4SHISdAtMtFEGCcbkJjYEWKQ6xolQbPygsfcrtX6F7wBFYC9bSryTDw
+OPENAI_API_KEY=sk-GtiZARPf7Ao8VxoSzz9HAeDbOytMCqX4kLY5WrmBYpFpXGN3eOETyw1FftwB5U6A
 OPENAI_BASE_URL=https://opencode.ai/zen/go/v1
 
 # Telegram Bot
