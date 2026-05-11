@@ -428,29 +428,37 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
     
     carrie_payload = "\n".join(carrie_lines)
     
-    # ── 主通道：Carrie webhook ──
+    # ── 主通道：Carrie webhook（含重試）──
     webhook_ok = False
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                CARRIE_WEBHOOK_URL,
-                headers={
-                    "Content-Type": "text/plain",
-                    "X-Webhook-Secret": CARRIE_WEBHOOK_SECRET,
-                    "X-Session-Id": session_id,
-                },
-                data=carrie_payload,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    webhook_ok = True
-                    results["channel"] = "webhook"
-                    logger.info(f"✅ Carrie webhook 成功: {resp.status}")
-                else:
-                    err = await resp.text()
-                    logger.warning(f"⚠️ Carrie webhook 失敗 ({resp.status}): {err[:100]}")
-    except Exception as e:
-        logger.warning(f"⚠️ Carrie webhook 不可達: {e}")
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    CARRIE_WEBHOOK_URL,
+                    headers={
+                        "Content-Type": "text/plain",
+                        "X-Webhook-Secret": CARRIE_WEBHOOK_SECRET,
+                        "X-Session-Id": session_id,
+                    },
+                    data=carrie_payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        webhook_ok = True
+                        results["channel"] = "webhook"
+                        logger.info(f"✅ Carrie webhook 成功: {resp.status} (attempt {attempt+1})")
+                        break
+                    else:
+                        err = await resp.text()
+                        logger.warning(f"⚠️ Carrie webhook 失敗 ({resp.status}): {err[:100]}")
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Carrie webhook 不可達 (attempt {attempt+1}/{max_retries+1}): "
+                f"type={type(e).__name__}, msg={str(e)[:150]}, url={CARRIE_WEBHOOK_URL}"
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(2)  # 等 2 秒再重試
     
     # ── Fallback：存入離線佇列 ──
     if not webhook_ok:
