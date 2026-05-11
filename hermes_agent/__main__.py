@@ -336,38 +336,10 @@ async def analyze_with_llm(text: str, session_id: str) -> str:
     支援 reasoning model（kimi-k2.5）：若 content 為空，
     嘗試用 httpx 直接呼叫 API 取得完整回應。
     """
-    # 方法一：透過 openai SDK
-    try:
-        response = await client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.7,
-            max_tokens=4096,
-        )
-        
-        content = response.choices[0].message.content
-        if content:
-            return content
-        
-        # reasoning model 可能把結果放在其他欄位
-        msg = response.choices[0].message
-        # 嘗試取得 reasoning（部分 SDK 版本支援）
-        reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
-        if reasoning:
-            logger.warning("LLM content 為空，使用 reasoning 欄位作為 fallback")
-            return reasoning
-        
-        logger.warning("LLM content 和 reasoning 皆為空，嘗試 httpx 直接呼叫")
-    except Exception as e:
-        logger.error(f"LLM SDK 呼叫失敗: {e}")
-    
-    # 方法二：直接用 httpx 呼叫（繞過 SDK 解析問題）
+    # 直接用 httpx 呼叫（reasoning model 的 content 欄位才是最終輸出）
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=120.0) as http:
+        async with httpx.AsyncClient(timeout=180.0) as http:
             r = await http.post(
                 f"{OPENAI_BASE_URL}/chat/completions",
                 headers={
@@ -381,28 +353,30 @@ async def analyze_with_llm(text: str, session_id: str) -> str:
                         {"role": "user", "content": text},
                     ],
                     "temperature": 0.7,
-                    "max_tokens": 4096,
+                    "max_tokens": 8192,
                 },
             )
             if r.status_code != 200:
-                logger.error(f"LLM HTTP 錯誤: {r.status_code} {r.text[:200]}")
+                logger.error(f"LLM HTTP 錯誤: {r.status_code} {r.text[:300]}")
                 return None
             
             data = r.json()
-            msg = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            msg = choice["message"]
             content = msg.get("content")
+            finish = choice.get("finish_reason", "unknown")
+            
+            logger.info(f"LLM 回應: finish_reason={finish}, content_len={len(content) if content else 0}")
+            
             if content:
                 return content
-            # fallback: reasoning 欄位
-            reasoning = msg.get("reasoning") or msg.get("reasoning_content")
-            if reasoning:
-                logger.info("使用 reasoning 欄位 (httpx fallback)")
-                return reasoning
             
-            logger.error(f"LLM 回應無 content 也無 reasoning: {str(msg)[:200]}")
+            # content 為空 = 模型可能 token 不夠，只產出了 reasoning
+            # 不要用 reasoning 當回應（那是內部思考，不含 JSONL）
+            logger.error(f"LLM content 為空 (finish={finish})，reasoning model 可能 token 不足")
             return None
     except Exception as e:
-        logger.error(f"LLM httpx fallback 失敗: {e}")
+        logger.error(f"LLM 呼叫失敗: {e}")
         return None
 
 
