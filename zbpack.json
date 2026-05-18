@@ -1,6 +1,5 @@
 {
     "build_command": "",
-    "start_command": "docker compose up -d",
-    "ignore_dockerfile": true,
-    "type": "docker-compose"
+    "start_command": "",
+    "ignore_dockerfile": false
 }
