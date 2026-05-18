@@ -1,5 +1,6 @@
 {
     "build_command": "",
     "start_command": "",
-    "ignore_dockerfile": false
+    "ignore_dockerfile": false,
+    "type": "docker"
 }

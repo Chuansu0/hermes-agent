@@ -1,0 +1,22 @@
+# Ignore the real hermes-agent submodule to prevent Zeabur from detecting it
+nousresearch-hermes-agent/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
