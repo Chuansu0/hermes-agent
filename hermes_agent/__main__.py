@@ -55,8 +55,43 @@ client = AsyncOpenAI(
 recent_analyses = []
 
 # ── 離線佇列（Home 離線時暫存 JSONL）──
-pending_queue = []  # list of {"ts": str, "session_id": str, "jsonl": str}
+# 使用檔案持久化，避免 Zeabur 容器重啟後 queue 遺失
+# 設定 QUEUE_PERSIST_PATH 環境變數（對應 Zeabur volume 掛載路徑）
+QUEUE_PERSIST_PATH = os.getenv("QUEUE_PERSIST_PATH", "/data/pending_queue.json")
 MAX_QUEUE_SIZE = 100
+
+pending_queue = []  # list of {"ts": str, "session_id": str, "jsonl": str}
+
+
+def _load_queue_from_disk():
+	"""從檔案載入持久化 queue（啟動時呼叫）"""
+	global pending_queue
+	try:
+		path = QUEUE_PERSIST_PATH
+		if os.path.exists(path):
+			with open(path, "r", encoding="utf-8") as f:
+				data = json.load(f)
+				if isinstance(data, list):
+					pending_queue = data
+					logger.info(f"📦 從磁碟恢復 queue: {len(pending_queue)} 筆")
+				else:
+					pending_queue = []
+		else:
+			pending_queue = []
+	except Exception as e:
+		logger.warning(f"載入 queue 失敗: {e}，重置為空佇列")
+		pending_queue = []
+
+
+def _save_queue_to_disk():
+	"""將 queue 寫入檔案持久化"""
+	try:
+		path = QUEUE_PERSIST_PATH
+		os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+		with open(path, "w", encoding="utf-8") as f:
+			json.dump(pending_queue, f, ensure_ascii=False)
+	except Exception as e:
+		logger.warning(f"儲存 queue 失敗: {e}")
 
 # System Prompt
 SYSTEM_PROMPT = """你是 Sherlock，一個專業的分析偵探 AI。
@@ -200,6 +235,7 @@ async def api_queue_drain(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     items = list(pending_queue)
     pending_queue.clear()
+    _save_queue_to_disk()  # 清空後同步到磁碟
     logger.info(f"📤 佇列已被 drain: {len(items)} 筆")
     return web.json_response({
         "drained": len(items),
@@ -469,6 +505,7 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
                 "session_id": session_id,
                 "jsonl": carrie_payload,
             })
+            _save_queue_to_disk()  # 持久化到磁碟，防止容器重啟遺失
             results["channel"] = "queued"
             logger.info(f"📦 已加入佇列 (共 {len(pending_queue)} 筆待處理)")
         else:
@@ -556,6 +593,9 @@ async def main_async():
     logger.info(f"n8n Webhook: {N8N_WEBHOOK_URL}")
     logger.info(f"Web Port: {WEB_PORT}")
     
+    # 從磁碟恢復離線佇列（容器重啟後還原待處理項目）
+    _load_queue_from_disk()
+
     # 先啟動 Web Server（Zeabur 健康檢查需要）
     await start_web_server()
     logger.info("✅ Web Server 就緒，開始初始化 Telegram Bot...")
