@@ -366,13 +366,12 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def analyze_with_llm(text: str, session_id: str) -> str:
+async def analyze_with_llm(text: str, session_id: str) -> tuple:
     """使用 LLM 分析輸入並產出 JSONL
     
-    支援 reasoning model（kimi-k2.5）：若 content 為空，
-    嘗試用 httpx 直接呼叫 API 取得完整回應。
+    回傳 (content: str | None, error_msg: str | None)
+    支援 reasoning model（kimi-k2.5）：content 欄位才是最終輸出。
     """
-    # 直接用 httpx 呼叫（reasoning model 的 content 欄位才是最終輸出）
     try:
         import httpx
         async with httpx.AsyncClient(timeout=180.0) as http:
@@ -393,27 +392,28 @@ async def analyze_with_llm(text: str, session_id: str) -> str:
                 },
             )
             if r.status_code != 200:
-                logger.error(f"LLM HTTP 錯誤: {r.status_code} {r.text[:300]}")
-                return None
+                err = f"LLM HTTP {r.status_code}: {r.text[:300]}"
+                logger.error(err)
+                return None, err
             
             data = r.json()
             choice = data["choices"][0]
-            msg = choice["message"]
-            content = msg.get("content")
+            msg_obj = choice["message"]
+            content = msg_obj.get("content")
             finish = choice.get("finish_reason", "unknown")
             
             logger.info(f"LLM 回應: finish_reason={finish}, content_len={len(content) if content else 0}")
             
             if content:
-                return content
+                return content, None
             
-            # content 為空 = 模型可能 token 不夠，只產出了 reasoning
-            # 不要用 reasoning 當回應（那是內部思考，不含 JSONL）
-            logger.error(f"LLM content 為空 (finish={finish})，reasoning model 可能 token 不足")
-            return None
+            err = f"LLM content 為空 (finish_reason={finish})，token 不足或 API 異常"
+            logger.error(err)
+            return None, err
     except Exception as e:
-        logger.error(f"LLM 呼叫失敗: {e}")
-        return None
+        err = f"LLM 呼叫失敗 [{type(e).__name__}]: {str(e)[:200]}"
+        logger.error(err)
+        return None, err
 
 
 async def send_to_n8n(jsonl_data: str, session_id: str) -> bool:
@@ -539,10 +539,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     try:
         # 使用 LLM 分析
-        llm_response = await analyze_with_llm(user_text, session_id)
+        llm_response, llm_error = await analyze_with_llm(user_text, session_id)
         
         if not llm_response:
-            await processing_msg.edit_text("❌ 分析失敗，請稍後再試")
+            await processing_msg.edit_text(f"❌ 分析失敗\n\n{llm_error or '未知錯誤'}")
             return
         
         # 提取 JSONL 部分（假設在最後）
