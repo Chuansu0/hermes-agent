@@ -45,6 +45,11 @@ DISPATCH_CHAT_ID = int(os.getenv("DISPATCH_CHAT_ID", "8240891231"))
 CARRIE_WEBHOOK_URL = os.getenv("CARRIE_WEBHOOK_URL", "https://home-n8n.neovega.cc/webhook/carrie-dispatch")
 CARRIE_WEBHOOK_SECRET = os.getenv("CARRIE_WEBHOOK_SECRET", "hermes-carrie-2026")
 
+# Telegram fallback queue（當 webhook 不可達時，透過 Telegram 補送）
+# 需設定 TELEGRAM_QUEUE_CHAT_ID 為 Sherlock + Carrie 共用的群組 chat_id
+# 或設為 DISPATCH_CHAT_ID（owner 私聊），搭配 Carrie 的 JSONL 直接解析
+TELEGRAM_QUEUE_CHAT_ID = int(os.getenv("TELEGRAM_QUEUE_CHAT_ID", "0"))
+
 # 初始化 OpenAI 客戶端
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
@@ -372,48 +377,63 @@ async def analyze_with_llm(text: str, session_id: str) -> tuple:
     回傳 (content: str | None, error_msg: str | None)
     支援 reasoning model（kimi-k2.5）：content 欄位才是最終輸出。
     """
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=180.0) as http:
-            r = await http.post(
-                f"{OPENAI_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": OPENAI_MODEL,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": text},
-                    ],
-                    "temperature": 0.7,
-                    "max_tokens": 8192,
-                },
-            )
-            if r.status_code != 200:
-                err = f"LLM HTTP {r.status_code}: {r.text[:300]}"
-                logger.error(err)
-                return None, err
-            
-            data = r.json()
-            choice = data["choices"][0]
-            msg_obj = choice["message"]
-            content = msg_obj.get("content")
-            finish = choice.get("finish_reason", "unknown")
-            
-            logger.info(f"LLM 回應: finish_reason={finish}, content_len={len(content) if content else 0}")
-            
-            if content:
-                return content, None
-            
-            err = f"LLM content 為空 (finish_reason={finish})，token 不足或 API 異常"
-            logger.error(err)
-            return None, err
-    except Exception as e:
-        err = f"LLM 呼叫失敗 [{type(e).__name__}]: {str(e)[:200]}"
-        logger.error(err)
-        return None, err
+    import httpx
+    max_retries = 3
+    last_err = None
+
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as http:
+                r = await http.post(
+                    f"{OPENAI_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": OPENAI_MODEL,
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": text},
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 8192,
+                    },
+                )
+                if r.status_code in (502, 503, 504):
+                    # 上游 proxy 暫時異常，等待後重試
+                    wait = 5 * (attempt + 1)
+                    last_err = f"LLM HTTP {r.status_code} (attempt {attempt+1}/{max_retries}，{wait}s 後重試)"
+                    logger.warning(last_err)
+                    await asyncio.sleep(wait)
+                    continue
+                if r.status_code != 200:
+                    last_err = f"LLM HTTP {r.status_code}: {r.text[:300]}"
+                    logger.error(last_err)
+                    return None, last_err
+
+                data = r.json()
+                choice = data["choices"][0]
+                msg_obj = choice["message"]
+                content = msg_obj.get("content")
+                finish = choice.get("finish_reason", "unknown")
+
+                logger.info(f"LLM 回應: finish_reason={finish}, content_len={len(content) if content else 0}")
+
+                if content:
+                    return content, None
+
+                last_err = f"LLM content 為空 (finish_reason={finish})，token 不足或 API 異常"
+                logger.error(last_err)
+                return None, last_err
+
+        except Exception as e:
+            last_err = f"LLM 呼叫失敗 [{type(e).__name__}] attempt {attempt+1}: {str(e)[:200]}"
+            logger.warning(last_err)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5 * (attempt + 1))
+
+    return None, f"LLM 重試 {max_retries} 次仍失敗: {last_err}"
 
 
 async def send_to_n8n(jsonl_data: str, session_id: str) -> bool:
@@ -496,23 +516,56 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
             if attempt < max_retries:
                 await asyncio.sleep(2)  # 等 2 秒再重試
     
-    # ── Fallback：存入離線佇列 ──
+    # ── Fallback：Telegram group 補送 + 離線佇列備份 ──
     if not webhook_ok:
-        logger.info("📦 Home 離線，存入佇列")
+        logger.info("📦 Home 離線，嘗試 Telegram fallback...")
+
+        # 優先通道：透過 Sherlock bot 發訊息到共用群組
+        # Carrie polling 啟動時，Telegram 會自動補送未讀群組訊息
+        tg_ok = False
+        if TELEGRAM_QUEUE_CHAT_ID != 0:
+            try:
+                tg_payload = (
+                    f"[SHERLOCK_QUEUE session={session_id}]\n"
+                    f"{carrie_payload}"
+                )
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                        json={
+                            "chat_id": TELEGRAM_QUEUE_CHAT_ID,
+                            "text": tg_payload,
+                            "parse_mode": None,  # 不解析 markdown，避免 JSONL 中的花括號出錯
+                        },
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        if resp.status == 200:
+                            tg_ok = True
+                            results["channel"] = "telegram_queue"
+                            logger.info(f"📨 JSONL 已透過 Telegram 群組補送 (chat_id={TELEGRAM_QUEUE_CHAT_ID})")
+                        else:
+                            body = await resp.text()
+                            logger.warning(f"⚠️ Telegram 補送失敗: HTTP {resp.status} {body[:100]}")
+            except Exception as e:
+                logger.warning(f"⚠️ Telegram 補送異常: {e}")
+
+        # 備用通道：存入離線佇列（即使 Telegram 成功也備份）
         if len(pending_queue) < MAX_QUEUE_SIZE:
             pending_queue.append({
                 "ts": datetime.now().isoformat(),
                 "session_id": session_id,
                 "jsonl": carrie_payload,
             })
-            _save_queue_to_disk()  # 持久化到磁碟，防止容器重啟遺失
-            results["channel"] = "queued"
-            logger.info(f"📦 已加入佇列 (共 {len(pending_queue)} 筆待處理)")
+            _save_queue_to_disk()
+            if not tg_ok:
+                results["channel"] = "queued"
+            logger.info(f"📦 已加入佇列備份 (共 {len(pending_queue)} 筆待處理)")
         else:
-            results["channel"] = "queue_full"
-            results["errors"].append("queue_full")
+            if not tg_ok:
+                results["channel"] = "queue_full"
+                results["errors"].append("queue_full")
             logger.error(f"❌ 佇列已滿 ({MAX_QUEUE_SIZE})")
-    
+
     return results
 
 
