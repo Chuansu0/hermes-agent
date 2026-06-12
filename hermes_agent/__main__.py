@@ -535,7 +535,7 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
                         json={
                             "chat_id": TELEGRAM_QUEUE_CHAT_ID,
                             "text": tg_payload,
-                            "parse_mode": None,  # 不解析 markdown，避免 JSONL 中的花括號出錯
+                            # parse_mode 不傳，避免 JSONL 花括號觸發 Telegram 格式錯誤
                         },
                         timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp:
