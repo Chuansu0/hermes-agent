@@ -236,12 +236,15 @@ async def api_queue_peek(request):
 async def api_queue_drain(request):
     """POST /api/queue/drain — 取出所有佇列項目（清空佇列）"""
     secret = request.headers.get("X-Webhook-Secret", "")
+    logger.info(f"📥 /api/queue/drain 收到請求，secret='{secret}', 預期='{QUEUE_SECRET}'")
     if secret != QUEUE_SECRET:
+        logger.warning(f"❌ /api/queue/drain 認證失敗：收到的='{secret}', 預期='{QUEUE_SECRET}'")
         return web.json_response({"error": "unauthorized"}, status=401)
     items = list(pending_queue)
     pending_queue.clear()
     _save_queue_to_disk()  # 清空後同步到磁碟
     logger.info(f"📤 佇列已被 drain: {len(items)} 筆")
+    logger.info(f"   queue size now: {len(pending_queue)}")
     return web.json_response({
         "drained": len(items),
         "items": items,
