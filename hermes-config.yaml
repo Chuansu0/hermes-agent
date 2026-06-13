@@ -2,7 +2,7 @@
 # 此檔案由 Zeabur configs 注入到 /opt/data/config.yaml
 
 model:
-  default: "kimi-k2.5"
+  default: "minimax-m2.5"
   provider: "custom"
   base_url: "https://opencode.ai/zen/go/v1"
 
