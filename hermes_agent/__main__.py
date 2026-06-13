@@ -516,40 +516,10 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
             if attempt < max_retries:
                 await asyncio.sleep(2)  # 等 2 秒再重試
     
-    # ── Fallback：Telegram group 補送 + 離線佇列備份 ──
+    # ── Fallback：離線佇列備份 ──
     if not webhook_ok:
-        logger.info("📦 Home 離線，嘗試 Telegram fallback...")
+        logger.info("📦 Home 離線，存入離線佇列...")
 
-        # 優先通道：透過 Sherlock bot 發訊息到共用群組
-        # Carrie polling 啟動時，Telegram 會自動補送未讀群組訊息
-        tg_ok = False
-        if TELEGRAM_QUEUE_CHAT_ID != 0:
-            try:
-                tg_payload = (
-                    f"[SHERLOCK_QUEUE session={session_id}]\n"
-                    f"{carrie_payload}"
-                )
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                        json={
-                            "chat_id": TELEGRAM_QUEUE_CHAT_ID,
-                            "text": tg_payload,
-                            # parse_mode 不傳，避免 JSONL 花括號觸發 Telegram 格式錯誤
-                        },
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as resp:
-                        if resp.status == 200:
-                            tg_ok = True
-                            results["channel"] = "telegram_queue"
-                            logger.info(f"📨 JSONL 已透過 Telegram 群組補送 (chat_id={TELEGRAM_QUEUE_CHAT_ID})")
-                        else:
-                            body = await resp.text()
-                            logger.warning(f"⚠️ Telegram 補送失敗: HTTP {resp.status} {body[:100]}")
-            except Exception as e:
-                logger.warning(f"⚠️ Telegram 補送異常: {e}")
-
-        # 備用通道：存入離線佇列（即使 Telegram 成功也備份）
         if len(pending_queue) < MAX_QUEUE_SIZE:
             pending_queue.append({
                 "ts": datetime.now().isoformat(),
@@ -557,13 +527,11 @@ async def dispatch_to_bots(jsonl_lines: list, session_id: str) -> dict:
                 "jsonl": carrie_payload,
             })
             _save_queue_to_disk()
-            if not tg_ok:
-                results["channel"] = "queued"
+            results["channel"] = "queued"
             logger.info(f"📦 已加入佇列備份 (共 {len(pending_queue)} 筆待處理)")
         else:
-            if not tg_ok:
-                results["channel"] = "queue_full"
-                results["errors"].append("queue_full")
+            results["channel"] = "queue_full"
+            results["errors"].append("queue_full")
             logger.error(f"❌ 佇列已滿 ({MAX_QUEUE_SIZE})")
 
     return results
@@ -598,17 +566,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await processing_msg.edit_text(f"❌ 分析失敗\n\n{llm_error or '未知錯誤'}")
             return
         
-        # 提取 JSONL 部分（假設在最後）
+        # 提取 JSONL 部分（處理 LLM 可能包在 ```json 代碼塊的情況）
         jsonl_lines = []
+        in_code_block = False
         for line in llm_response.split('\n'):
-            line = line.strip()
-            if line.startswith('{'):
-                jsonl_lines.append(line)
-        
+            stripped = line.strip()
+            # 跳過 markdown 代碼塊標記
+            if stripped.startswith('```'):
+                in_code_block = not in_code_block
+                continue
+            if stripped.startswith('{') and stripped.endswith('}'):
+                jsonl_lines.append(stripped)
+
         jsonl_data = '\n'.join(jsonl_lines)
-        
+
+        # debug: 顯示 LLM 原始回應的最後 300 字，幫助診斷
+        logger.info(f"LLM 原始回應後段: ...{llm_response[-400:]}")
+        logger.info(f"提取到 JSONL 行數: {len(jsonl_lines)}")
+
         if not jsonl_data:
-            await processing_msg.edit_text(f"⚠️ 無法產出 JSONL 指令\n\nLLM 回應:\n{llm_response[:500]}")
+            await processing_msg.edit_text(
+                f"⚠️ 無法產出 JSONL 指令\n\n"
+                f"LLM 回應後段:\n{llm_response[-400:]}"
+            )
             return
         
         # 兩段式 dispatch：webhook → n8n fallback
