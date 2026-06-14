@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Hermes Agent - neovegasherlock_bot
-執行於 Zeabur VPS，使用 kimi-k2.5 模型分析輸入並產出 JSONL 指令
+執行於 Zeabur VPS，使用 minimax-m2.5 模型分析輸入並產出 JSONL 指令
 包含 Web UI 端口供外部連線
 """
 
@@ -207,7 +207,7 @@ async def web_index(request):
         <div class="status">
             <h3>狀態</h3>
             <p>🤖 Bot: neovegasherlock_bot</p>
-            <p>🧠 模型: kimi-k2.5</p>
+            <p>🧠 模型: minimax-m2.5</p>
             <p>📡 n8n: Connected</p>
             <p>⏰ 啟動時間: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
         </div>
@@ -297,7 +297,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """/start 指令"""
     await update.message.reply_text(
         "🔍 neovegasherlock_bot 已啟動\n\n"
-        "我是 Hermes Agent 指揮中心，使用 kimi-k2.5 模型進行分析。\n"
+        "我是 Hermes Agent 指揮中心，使用 minimax-m2.5 模型進行分析。\n"
         "發送任何訊息給我，我會分析並產出 JSONL 指令給 Conan 或 Carrie 執行。\n\n"
         "使用 /help 查看說明。"
     )
@@ -400,7 +400,7 @@ async def analyze_with_llm(text: str, session_id: str) -> tuple:
     """使用 LLM 分析輸入並產出 JSONL
     
     回傳 (content: str | None, error_msg: str | None)
-    支援 reasoning model（kimi-k2.5）：content 欄位才是最終輸出。
+    支援 reasoning model（minimax-m2.5）：content 欄位才是最終輸出。
     """
     import httpx
     max_retries = 3
