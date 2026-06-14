@@ -25,11 +25,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── 從 hermes-env 檔案讀取設定（不寫死在程式碼）──
+ENV_FILE = os.path.join(os.path.dirname(__file__), "..", "hermes-env")
+
+def _load_env():
+    """從 hermes-env 檔案讀取環境變數"""
+    env = {}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, val = line.split("=", 1)
+                    env[key.strip()] = val.strip()
+    return env
+
+_hermes_env = _load_env()
+logger.info(f"📋 讀取 hermes-env: {len(_hermes_env)} 個變數")
+
+def _get(key: str, default: str = "") -> str:
+    """優先從 hermes-env 讀取，否則用 os.getenv，最後用 default"""
+    return _hermes_env.get(key) or os.getenv(key) or default
+
 # 設定
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8505666076:AAFsPUQCBA7UVdIiw8ItBU3QHDbggI6Payg")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-GtiZARPf7Ao8VxoSzz9HAeDbOytMCqX4kLY5WrmBYpFpXGN3eOETyw1FftwB5U6A")
-OPENAI_BASE_URL = os.getenv("OPENAI_API_BASE", "https://opencode.ai/zen/go/v1")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "kimi-k2.5")
+TOKEN = _get("TELEGRAM_BOT_TOKEN", "8505666076:AAFsPUQCBA7UVdIiw8ItBU3QHDbggI6Payg")
+OPENAI_API_KEY = _get("OPENAI_API_KEY")  # 從 hermes-env 讀取，無 default
+OPENAI_BASE_URL = _get("OPENAI_API_BASE", "https://opencode.ai/zen/go/v1")
+OPENAI_MODEL = _get("OPENAI_MODEL", "minimax-m2.5")
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n.neovega.cc/webhook/sherlock-output")
 WEB_PORT = int(os.getenv("PORT", "8080"))
 
